@@ -5,7 +5,7 @@
 
 ### Preparation
 ```commandline
-    composer require merakilab/meraki-data-safety
+composer require merakilab/meraki-data-safety
 ```
 
 ### Backup / restores a full table before migration down
