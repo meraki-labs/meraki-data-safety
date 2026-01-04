@@ -6,8 +6,6 @@
 ### Preparation
 ```commandline
     composer require merakilab/meraki-data-safety
-    php artisan vendor:publish --tag=meraki-data-safety-migrations
-    php artisan migrate
 ```
 
 ### Backup / restores a full table before migration down
