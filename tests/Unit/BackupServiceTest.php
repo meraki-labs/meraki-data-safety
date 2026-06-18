@@ -4,107 +4,92 @@ namespace Meraki\Packages\DataSafety\Tests\Unit;
 
 use Illuminate\Support\Facades\DB;
 use Meraki\Packages\DataSafety\Services\BackupService;
-use PHPUnit\Framework\TestCase;
+use Meraki\Packages\DataSafety\Tests\TestCase;
 
 class BackupServiceTest extends TestCase
 {
-    /**
-     * Test that backup() calls the writer callback for each row.
-     * We mock DB::table()->chunk() behavior using a concrete subclass.
-     */
+    protected function setUp(): void
+    {
+        parent::setUp();
+        DB::statement('CREATE TABLE test_users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
+    }
+
+    protected function tearDown(): void
+    {
+        DB::statement('DROP TABLE IF EXISTS test_users');
+        parent::tearDown();
+    }
+
     public function test_backup_calls_writer_for_each_row(): void
     {
-        $rows = [
-            (object) ['id' => 1, 'name' => 'Alice'],
-            (object) ['id' => 2, 'name' => 'Bob'],
-        ];
+        DB::table('test_users')->insert([
+            ['id' => 1, 'name' => 'Alice', 'email' => 'alice@example.com'],
+            ['id' => 2, 'name' => 'Bob',   'email' => 'bob@example.com'],
+        ]);
 
-        $calledWith = [];
-        $writer = function (array $row) use (&$calledWith) {
-            $calledWith[] = $row;
-        };
+        $rows = [];
+        (new BackupService('test_users', ['id'], 10))->backup(function ($row) use (&$rows) {
+            $rows[] = $row;
+        });
 
-        // Create a testable subclass that bypasses DB
-        $testableService = new class('users', ['id'], 2) extends BackupService {
-            public array $fakeRows = [];
-
-            public function backup(callable $writer): void
-            {
-                $chunks = array_chunk($this->fakeRows, $this->chunkSize);
-                foreach ($chunks as $chunk) {
-                    foreach ($chunk as $row) {
-                        $writer((array) $row);
-                    }
-                }
-            }
-        };
-
-        $testableService->fakeRows = $rows;
-        $testableService->backup($writer);
-
-        $this->assertCount(2, $calledWith);
-        $this->assertSame(['id' => 1, 'name' => 'Alice'], $calledWith[0]);
-        $this->assertSame(['id' => 2, 'name' => 'Bob'], $calledWith[1]);
+        $this->assertCount(2, $rows);
+        $this->assertSame('Alice', $rows[0]['name']);
+        $this->assertSame('Bob',   $rows[1]['name']);
     }
 
     public function test_backup_does_not_call_writer_for_empty_table(): void
     {
-        $testableService = new class('users', ['id'], 1000) extends BackupService {
-            public function backup(callable $writer): void
-            {
-                // Empty table — no rows
-            }
-        };
-
         $called = false;
-        $testableService->backup(function () use (&$called) {
+        (new BackupService('test_users', ['id'], 10))->backup(function () use (&$called) {
             $called = true;
         });
 
         $this->assertFalse($called);
     }
 
-    public function test_columns_limits_select_to_specified_columns(): void
+    public function test_columns_limits_backed_up_columns(): void
     {
-        $service = new BackupService('users', ['id'], 1000);
-        $result = $service->columns(['id', 'name']);
+        DB::table('test_users')->insert(['id' => 1, 'name' => 'Alice', 'email' => 'alice@example.com']);
 
-        // columns() returns $this for chaining
-        $this->assertSame($service, $result);
+        $rows = [];
+        (new BackupService('test_users', ['id'], 10))
+            ->columns(['id', 'email'])
+            ->backup(function ($row) use (&$rows) {
+                $rows[] = $row;
+            });
 
-        // Verify the internal columns property was set
-        $ref = new \ReflectionProperty(BackupService::class, 'columns');
-        $ref->setAccessible(true);
-        $this->assertSame(['id', 'name'], $ref->getValue($service));
+        $this->assertCount(1, $rows);
+        $this->assertArrayHasKey('email', $rows[0]);
+        $this->assertArrayNotHasKey('name', $rows[0]);
     }
 
-    public function test_backup_chunks_rows_by_chunkSize(): void
+    public function test_backup_respects_chunk_size_and_returns_all_rows(): void
     {
-        $rows = array_map(fn($i) => (object) ['id' => $i, 'val' => "row$i"], range(1, 5));
+        for ($i = 1; $i <= 7; $i++) {
+            DB::table('test_users')->insert(['id' => $i, 'name' => "User{$i}", 'email' => "u{$i}@example.com"]);
+        }
 
-        $chunkSizes = [];
-        $testableService = new class('users', ['id'], 2) extends BackupService {
-            public array $fakeRows = [];
-            public array $capturedChunkSizes = [];
+        $rows = [];
+        (new BackupService('test_users', ['id'], 3))->backup(function ($row) use (&$rows) {
+            $rows[] = $row;
+        });
 
-            public function backup(callable $writer): void
-            {
-                $chunks = array_chunk($this->fakeRows, $this->chunkSize);
-                foreach ($chunks as $chunk) {
-                    $this->capturedChunkSizes[] = count($chunk);
-                    foreach ($chunk as $row) {
-                        $writer((array) $row);
-                    }
-                }
-            }
-        };
+        $this->assertCount(7, $rows);
+    }
 
-        $testableService->fakeRows = $rows;
-        $called = 0;
-        $testableService->backup(function () use (&$called) { $called++; });
+    public function test_backup_orders_by_first_key_column(): void
+    {
+        DB::table('test_users')->insert([
+            ['id' => 3, 'name' => 'Charlie', 'email' => 'c@example.com'],
+            ['id' => 1, 'name' => 'Alice',   'email' => 'a@example.com'],
+            ['id' => 2, 'name' => 'Bob',     'email' => 'b@example.com'],
+        ]);
 
-        $this->assertSame(5, $called);
-        // 5 rows / chunk=2 => [2, 2, 1]
-        $this->assertSame([2, 2, 1], $testableService->capturedChunkSizes);
+        $ids = [];
+        (new BackupService('test_users', ['id'], 10))->backup(function ($row) use (&$ids) {
+            $ids[] = $row['id'];
+        });
+
+        $this->assertSame([1, 2, 3], $ids);
     }
 }

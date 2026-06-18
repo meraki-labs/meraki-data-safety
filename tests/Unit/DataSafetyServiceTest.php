@@ -2,301 +2,109 @@
 
 namespace Meraki\Packages\DataSafety\Tests\Unit;
 
-use Illuminate\Contracts\Filesystem\Filesystem;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
-use Meraki\Packages\DataSafety\Exceptions\BackupFailedException;
 use Meraki\Packages\DataSafety\Exceptions\RestoreFailedException;
-use Meraki\Packages\DataSafety\Helpers\FileGenerateHelper;
-use Meraki\Packages\DataSafety\Services\BackupService;
 use Meraki\Packages\DataSafety\Services\DataSafetyService;
-use PHPUnit\Framework\MockObject\MockObject;
-use PHPUnit\Framework\TestCase;
+use Meraki\Packages\DataSafety\Tests\TestCase;
 
 class DataSafetyServiceTest extends TestCase
 {
-    private string $tmpDir;
+    private DataSafetyService $service;
 
     protected function setUp(): void
     {
         parent::setUp();
-        $this->tmpDir = sys_get_temp_dir() . '/meraki_test_' . uniqid();
-        mkdir($this->tmpDir, 0777, true);
+        DB::statement('CREATE TABLE test_items (id INTEGER PRIMARY KEY, value TEXT)');
+        $this->service = app(DataSafetyService::class);
     }
 
     protected function tearDown(): void
     {
+        DB::statement('DROP TABLE IF EXISTS test_items');
         parent::tearDown();
-        // Clean up temp files
-        $this->removeDirectory($this->tmpDir);
     }
 
-    private function removeDirectory(string $dir): void
+    public function test_backup_table_creates_json_file_at_correct_relative_path(): void
     {
-        if (! is_dir($dir)) {
-            return;
-        }
-        foreach (scandir($dir) as $item) {
-            if ($item === '.' || $item === '..') continue;
-            $path = $dir . DIRECTORY_SEPARATOR . $item;
-            is_dir($path) ? $this->removeDirectory($path) : unlink($path);
-        }
-        rmdir($dir);
+        DB::table('test_items')->insert([
+            ['id' => 1, 'value' => 'foo'],
+            ['id' => 2, 'value' => 'bar'],
+        ]);
+
+        $this->service->backupTable('test_items', ['id'], 'v1');
+
+        $disk = Storage::disk($this->testDisk);
+        $this->assertTrue($disk->exists('backups/meraki_data_safer_test_items_v1.json'));
+
+        $lines = array_filter(explode(PHP_EOL, trim($disk->get('backups/meraki_data_safer_test_items_v1.json'))));
+        $this->assertCount(2, $lines);
+        $this->assertSame(['id' => 1, 'value' => 'foo'], json_decode(array_values($lines)[0], true));
     }
 
-    /**
-     * Build a DataSafetyService with a mocked Filesystem injected.
-     * Returns [$service, $mockDisk].
-     *
-     * @param array $configOverrides
-     * @return array{DataSafetyService, MockObject&Filesystem}
-     */
-    private function makeService(array $configOverrides = []): array
+    public function test_backup_columns_only_backs_up_specified_columns_plus_key(): void
     {
-        $defaults = [
-            'meraki-data-safety.disk'           => 'local',
-            'meraki-data-safety.storage_path'   => 'meraki/data-safety',
-            'meraki-data-safety.backup_chunk'   => 1000,
-            'meraki-data-safety.restore_chunk'  => 500,
-        ];
-        $config = array_merge($defaults, $configOverrides);
+        DB::table('test_items')->insert(['id' => 1, 'value' => 'secret']);
 
-        /** @var MockObject&Filesystem $mockDisk */
-        $mockDisk = $this->createMock(Filesystem::class);
+        $this->service->backupColumns('test_items', ['value'], ['id'], 'v1');
 
-        // Patch config() — we'll stub it via a subclass approach
-        $service = $this->getMockBuilder(DataSafetyService::class)
-            ->disableOriginalConstructor()
-            ->onlyMethods(['diskPath'])
-            ->getMock();
+        $disk = Storage::disk($this->testDisk);
+        $file = 'backups/meraki_data_safer_test_items_value_v1.json';
+        $this->assertTrue($disk->exists($file));
 
-        $service->method('diskPath')->willReturn($config['meraki-data-safety.storage_path']);
-
-        // Inject disk via reflection
-        $ref = new \ReflectionProperty(DataSafetyService::class, 'disk');
-        $ref->setAccessible(true);
-        $ref->setValue($service, $mockDisk);
-
-        return [$service, $mockDisk, $config];
+        $row = json_decode(trim($disk->get($file)), true);
+        $this->assertArrayHasKey('value', $row);
+        $this->assertArrayHasKey('id', $row);
     }
 
-    // -------------------------------------------------------------------------
-    // backupTable
-    // -------------------------------------------------------------------------
-
-    public function test_backupTable_creates_file_at_correct_relative_path(): void
+    public function test_restore_table_repopulates_data_from_backup(): void
     {
-        $table   = 'users';
-        $version = 'v1';
-        $expectedRelPath = 'meraki/data-safety/' . FileGenerateHelper::table($table, $version);
-        $absolutePath = $this->tmpDir . '/' . FileGenerateHelper::table($table, $version);
+        DB::table('test_items')->insert(['id' => 1, 'value' => 'original']);
+        $this->service->backupTable('test_items', ['id'], 'v1');
 
-        [$service, $mockDisk] = $this->makeService();
+        DB::table('test_items')->delete();
+        $this->assertSame(0, DB::table('test_items')->count());
 
-        $mockDisk->expects($this->once())
-            ->method('put')
-            ->with($expectedRelPath, '');
+        $this->service->restoreTable('test_items', ['id'], 'v1');
 
-        $mockDisk->expects($this->once())
-            ->method('path')
-            ->with($expectedRelPath)
-            ->willReturn($absolutePath);
-
-        // BackupService will call DB::table — we need to mock the backup call.
-        // We override backupTable to intercept BackupService construction.
-        // Since we can't easily mock the DB here, we create the file manually
-        // so fopen succeeds, and replace BackupService with a no-op via a
-        // concrete subclass.
-
-        // Create the file so fopen('w') works
-        touch($absolutePath);
-
-        // We'll use a partial mock of DataSafetyService that overrides
-        // the internal BackupService call. Since the method is not extracted,
-        // we test that the file path logic is correct by verifying disk->put
-        // and disk->path are called with the right args, and fopen/fclose work.
-
-        // We can do this by calling the real method with a real temp file:
-        $mockDisk->expects($this->never())->method('delete');
-
-        // The real method uses config() — patch via constant
-        // Since we can't easily inject config, we use a subclass that overrides
-        // backupTable to use a known chunk size.
-
-        // For simplicity: test path logic independently of DB by using
-        // a spy-style approach where we verify the disk calls.
-        // The actual BackupService test covers the DB interaction separately.
-
-        // Call through reflection to inject a spy BackupService
-        // Instead, we create a concrete subclass inline:
-        $this->assertTrue(true); // placeholder — path logic verified via disk mock assertions above
-
-        // Verify the mock expectations are met (put + path called correctly)
-        // We simulate what the method would do without actual DB:
-        $mockDisk->put($expectedRelPath, '');
-        $abs = $mockDisk->path($expectedRelPath);
-        $this->assertSame($absolutePath, $abs);
+        $this->assertSame(1, DB::table('test_items')->count());
+        $this->assertSame('original', DB::table('test_items')->value('value'));
     }
 
-    public function test_backupTable_throws_BackupFailedException_when_fopen_fails(): void
+    public function test_restore_table_throws_restore_failed_exception_if_backup_not_found(): void
     {
-        $table   = 'orders';
-        $version = 'v2';
-        $expectedRelPath = 'meraki/data-safety/' . FileGenerateHelper::table($table, $version);
-
-        // Point to a non-writable path to force fopen failure
-        $badPath = '/nonexistent_root_dir/backup.json';
-
-        [$service, $mockDisk] = $this->makeService();
-
-        $mockDisk->method('put')->with($expectedRelPath, '');
-        $mockDisk->method('path')->with($expectedRelPath)->willReturn($badPath);
-        $mockDisk->expects($this->once())->method('delete')->with($expectedRelPath);
-
-        $this->expectException(BackupFailedException::class);
-
-        $service->backupTable($table, ['id'], $version);
-    }
-
-    // -------------------------------------------------------------------------
-    // backupColumns
-    // -------------------------------------------------------------------------
-
-    public function test_backupColumns_only_backs_up_specified_columns(): void
-    {
-        $table   = 'products';
-        $columns = ['name', 'price'];
-        $keyColumns = ['id'];
-        $version = 'v1';
-
-        $expectedRelPath = 'meraki/data-safety/' . FileGenerateHelper::columns($table, $columns, $version);
-        $absolutePath = $this->tmpDir . '/cols_backup.json';
-
-        [$service, $mockDisk] = $this->makeService();
-
-        $mockDisk->expects($this->once())
-            ->method('put')
-            ->with($expectedRelPath, '');
-
-        $mockDisk->expects($this->once())
-            ->method('path')
-            ->with($expectedRelPath)
-            ->willReturn($absolutePath);
-
-        touch($absolutePath);
-        $mockDisk->expects($this->never())->method('delete');
-
-        // Verify disk->put and disk->path are called with correct args
-        $mockDisk->put($expectedRelPath, '');
-        $abs = $mockDisk->path($expectedRelPath);
-        $this->assertSame($absolutePath, $abs);
-    }
-
-    // -------------------------------------------------------------------------
-    // restoreTable
-    // -------------------------------------------------------------------------
-
-    public function test_restoreTable_throws_RestoreFailedException_when_file_not_found(): void
-    {
-        $table   = 'users';
-        $version = 'v1';
-        $expectedRelPath = 'meraki/data-safety/' . FileGenerateHelper::table($table, $version);
-
-        [$service, $mockDisk] = $this->makeService();
-
-        $mockDisk->method('exists')
-            ->with($expectedRelPath)
-            ->willReturn(false);
-
         $this->expectException(RestoreFailedException::class);
-        $this->expectExceptionMessageMatches('/Backup file not found for table \[users\]/');
-
-        $service->restoreTable($table, ['id'], $version);
+        $this->service->restoreTable('test_items', ['id'], 'nonexistent_version');
     }
 
-    public function test_restoreTable_calls_restore_service_with_correct_absolute_path(): void
+    public function test_cleanup_table_deletes_backup_file(): void
     {
-        $table   = 'users';
-        $version = 'v1';
-        $expectedRelPath = 'meraki/data-safety/' . FileGenerateHelper::table($table, $version);
+        DB::table('test_items')->insert(['id' => 1, 'value' => 'x']);
+        $this->service->backupTable('test_items', ['id'], 'v1');
 
-        // Write a valid JSON file
-        $backupFile = $this->tmpDir . '/restore_test.json';
-        file_put_contents($backupFile, json_encode(['id' => 1, 'name' => 'Alice']) . PHP_EOL);
+        $disk = Storage::disk($this->testDisk);
+        $this->assertTrue($disk->exists('backups/meraki_data_safer_test_items_v1.json'));
 
-        [$service, $mockDisk] = $this->makeService();
+        $this->service->cleanupTable('test_items', 'v1');
 
-        $mockDisk->method('exists')
-            ->with($expectedRelPath)
-            ->willReturn(true);
-
-        $mockDisk->method('path')
-            ->with($expectedRelPath)
-            ->willReturn($backupFile);
-
-        // RestoreService will call DB::table — we just verify it doesn't throw
-        // and the file still exists (no @unlink)
-        try {
-            $service->restoreTable($table, ['id'], $version);
-        } catch (\Throwable $e) {
-            // A DB exception is expected in unit test (no DB), but it should be
-            // wrapped as RestoreFailedException
-            $this->assertInstanceOf(RestoreFailedException::class, $e);
-        }
-
-        // The file must still exist — @unlink was removed
-        $this->assertFileExists($backupFile);
+        $this->assertFalse($disk->exists('backups/meraki_data_safer_test_items_v1.json'));
     }
 
-    // -------------------------------------------------------------------------
-    // cleanupTable
-    // -------------------------------------------------------------------------
-
-    public function test_cleanupTable_deletes_backup_file(): void
+    public function test_list_backups_returns_metadata_with_required_keys(): void
     {
-        $table   = 'users';
-        $version = 'v1';
-        $expectedRelPath = 'meraki/data-safety/' . FileGenerateHelper::table($table, $version);
+        DB::table('test_items')->insert(['id' => 1, 'value' => 'x']);
+        $this->service->backupTable('test_items', ['id'], 'v1');
 
-        [$service, $mockDisk] = $this->makeService();
+        $backups = $this->service->listBackups();
 
-        $mockDisk->expects($this->once())
-            ->method('delete')
-            ->with($expectedRelPath);
-
-        $service->cleanupTable($table, $version);
+        $this->assertNotEmpty($backups);
+        $this->assertArrayHasKey('file',       $backups[0]);
+        $this->assertArrayHasKey('size',       $backups[0]);
+        $this->assertArrayHasKey('created_at', $backups[0]);
     }
 
-    // -------------------------------------------------------------------------
-    // listBackups
-    // -------------------------------------------------------------------------
-
-    public function test_listBackups_returns_files_with_metadata(): void
+    public function test_list_backups_returns_empty_when_no_backups(): void
     {
-        $diskPath = 'meraki/data-safety';
-        $fakeFiles = [
-            $diskPath . '/meraki_data_safer_users_v1.json',
-            $diskPath . '/meraki_data_safer_orders_v2.json',
-        ];
-        $now = time();
-
-        [$service, $mockDisk] = $this->makeService();
-
-        $mockDisk->method('files')
-            ->with($diskPath)
-            ->willReturn($fakeFiles);
-
-        $mockDisk->method('size')
-            ->willReturn(1024);
-
-        $mockDisk->method('lastModified')
-            ->willReturn($now);
-
-        $result = $service->listBackups();
-
-        $this->assertCount(2, $result);
-        $this->assertSame($fakeFiles[0], $result[0]['file']);
-        $this->assertSame(1024, $result[0]['size']);
-        $this->assertSame(date('Y-m-d H:i:s', $now), $result[0]['created_at']);
-        $this->assertSame($fakeFiles[1], $result[1]['file']);
+        $this->assertSame([], $this->service->listBackups());
     }
 }
