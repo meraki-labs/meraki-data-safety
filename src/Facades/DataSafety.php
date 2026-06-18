@@ -1,13 +1,14 @@
 <?php
 
-namespace Meraki\DataSafety\Facades;
+namespace Meraki\Packages\DataSafety\Facades;
 
 use Illuminate\Support\Facades\Facade;
+use Meraki\Packages\DataSafety\Contracts\DataSafetyServiceContract;
 
 class DataSafety extends Facade
 {
     protected static function getFacadeAccessor(): string
     {
-        return 'meraki-data-safety';
+        return DataSafetyServiceContract::class;
     }
 }

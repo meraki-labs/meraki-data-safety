@@ -1,0 +1,7 @@
+{
+  "id": "meraki-data-safety",
+  "name": "Meraki Data Safety",
+  "version": "1.0.0",
+  "provider": "Meraki\\Packages\\DataSafety\\DataSafetyServiceProvider",
+  "config": "meraki-data-safety"
+}
