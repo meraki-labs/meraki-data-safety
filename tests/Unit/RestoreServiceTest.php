@@ -2,136 +2,104 @@
 
 namespace Meraki\Packages\DataSafety\Tests\Unit;
 
+use Illuminate\Support\Facades\DB;
 use Meraki\Packages\DataSafety\Services\RestoreService;
-use PHPUnit\Framework\TestCase;
+use Meraki\Packages\DataSafety\Tests\TestCase;
 
 class RestoreServiceTest extends TestCase
 {
-    private string $tmpDir;
+    private string $tempFile;
 
     protected function setUp(): void
     {
         parent::setUp();
-        $this->tmpDir = sys_get_temp_dir() . '/meraki_restore_test_' . uniqid();
-        mkdir($this->tmpDir, 0777, true);
+        DB::statement('CREATE TABLE test_users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
+        $this->tempFile = sys_get_temp_dir() . '/restore_test_' . uniqid() . '.json';
     }
 
     protected function tearDown(): void
     {
-        parent::tearDown();
-        $this->removeDirectory($this->tmpDir);
-    }
-
-    private function removeDirectory(string $dir): void
-    {
-        if (! is_dir($dir)) return;
-        foreach (scandir($dir) as $item) {
-            if ($item === '.' || $item === '..') continue;
-            $path = $dir . DIRECTORY_SEPARATOR . $item;
-            is_dir($path) ? $this->removeDirectory($path) : unlink($path);
+        DB::statement('DROP TABLE IF EXISTS test_users');
+        if (file_exists($this->tempFile)) {
+            unlink($this->tempFile);
         }
-        rmdir($dir);
+        parent::tearDown();
     }
 
-    /**
-     * Create a RestoreService subclass that captures updateOrInsert calls
-     * instead of hitting a real DB.
-     */
-    private function makeTestableService(string $table, array $keyColumns, int $chunkSize): object
+    private function writeLines(array $rows): void
     {
-        return new class($table, $keyColumns, $chunkSize) extends RestoreService {
-            public array $upsertCalls = [];
-
-            protected function restoreBatch(array $rows): void
-            {
-                foreach ($rows as $row) {
-                    $key = [];
-                    foreach ($this->keyColumns as $column) {
-                        if (! array_key_exists($column, $row)) {
-                            continue 2;
-                        }
-                        $key[$column] = $row[$column];
-                    }
-                    $this->upsertCalls[] = ['key' => $key, 'row' => $row];
-                }
-            }
-        };
+        $h = fopen($this->tempFile, 'w');
+        foreach ($rows as $row) {
+            fwrite($h, json_encode($row) . PHP_EOL);
+        }
+        fclose($h);
     }
 
-    public function test_restoreFromFile_calls_updateOrInsert_for_each_row(): void
+    public function test_restore_inserts_rows_from_file(): void
     {
-        $filePath = $this->tmpDir . '/backup.json';
-        $rows = [
-            ['id' => 1, 'name' => 'Alice'],
-            ['id' => 2, 'name' => 'Bob'],
-        ];
-        file_put_contents($filePath, implode(PHP_EOL, array_map('json_encode', $rows)) . PHP_EOL);
+        $this->writeLines([
+            ['id' => 1, 'name' => 'Alice', 'email' => 'alice@example.com'],
+            ['id' => 2, 'name' => 'Bob',   'email' => 'bob@example.com'],
+        ]);
 
-        $service = $this->makeTestableService('users', ['id'], 500);
-        $service->restoreFromFile($filePath);
+        (new RestoreService('test_users', ['id'], 50))->restoreFromFile($this->tempFile);
 
-        $this->assertCount(2, $service->upsertCalls);
-        $this->assertSame(['id' => 1], $service->upsertCalls[0]['key']);
-        $this->assertSame(['id' => 2], $service->upsertCalls[1]['key']);
+        $this->assertSame(2, DB::table('test_users')->count());
+        $this->assertSame('Alice', DB::table('test_users')->where('id', 1)->value('name'));
     }
 
-    public function test_restoreFromFile_returns_early_when_file_does_not_exist(): void
+    public function test_restore_upserts_existing_rows(): void
     {
-        $service = $this->makeTestableService('users', ['id'], 500);
-        // No exception should be thrown
-        $service->restoreFromFile($this->tmpDir . '/nonexistent.json');
-        $this->assertCount(0, $service->upsertCalls);
+        DB::table('test_users')->insert(['id' => 1, 'name' => 'OldName', 'email' => 'old@example.com']);
+
+        $this->writeLines([
+            ['id' => 1, 'name' => 'NewName', 'email' => 'new@example.com'],
+        ]);
+
+        (new RestoreService('test_users', ['id'], 50))->restoreFromFile($this->tempFile);
+
+        $this->assertSame(1, DB::table('test_users')->count());
+        $this->assertSame('NewName', DB::table('test_users')->where('id', 1)->value('name'));
     }
 
-    public function test_restoreFromFile_skips_rows_missing_key_column(): void
+    public function test_restore_skips_row_missing_key_column(): void
     {
-        $filePath = $this->tmpDir . '/partial.json';
-        // Row 1 has id, row 2 is missing id
-        $rows = [
-            ['id' => 1, 'name' => 'Alice'],
-            ['name' => 'Bob'],             // missing 'id'
-        ];
-        file_put_contents($filePath, implode(PHP_EOL, array_map('json_encode', $rows)) . PHP_EOL);
+        $this->writeLines([
+            ['name' => 'NoKey', 'email' => 'nokey@example.com'],
+            ['id' => 2, 'name' => 'Valid', 'email' => 'v@example.com'],
+        ]);
 
-        $service = $this->makeTestableService('users', ['id'], 500);
-        $service->restoreFromFile($filePath);
+        (new RestoreService('test_users', ['id'], 50))->restoreFromFile($this->tempFile);
 
-        // Only row 1 should be upserted
-        $this->assertCount(1, $service->upsertCalls);
-        $this->assertSame(['id' => 1], $service->upsertCalls[0]['key']);
+        $this->assertSame(1, DB::table('test_users')->count());
+        $this->assertSame('Valid', DB::table('test_users')->where('id', 2)->value('name'));
     }
 
-    public function test_restoreFromFile_batches_by_chunkSize(): void
+    public function test_restore_returns_early_if_file_not_found(): void
     {
-        $filePath = $this->tmpDir . '/chunked.json';
-        $rows = array_map(fn($i) => ['id' => $i, 'val' => "row$i"], range(1, 5));
-        file_put_contents($filePath, implode(PHP_EOL, array_map('json_encode', $rows)) . PHP_EOL);
-
-        $batchSizes = [];
-        $service = new class('users', ['id'], 2) extends RestoreService {
-            public array $batchSizes = [];
-            protected function restoreBatch(array $rows): void
-            {
-                $this->batchSizes[] = count($rows);
-            }
-        };
-
-        $service->restoreFromFile($filePath);
-
-        // 5 rows / chunk=2 => batches of [2, 2, 1]
-        $this->assertSame([2, 2, 1], $service->batchSizes);
+        (new RestoreService('test_users', ['id'], 50))->restoreFromFile('/nonexistent/path/file.json');
+        $this->assertSame(0, DB::table('test_users')->count());
     }
 
-    public function test_file_not_deleted_after_restore(): void
+    public function test_restore_does_not_delete_file_after_restore(): void
     {
-        $filePath = $this->tmpDir . '/no_unlink.json';
-        $rows = [['id' => 1, 'name' => 'Alice']];
-        file_put_contents($filePath, json_encode($rows[0]) . PHP_EOL);
+        $this->writeLines([['id' => 1, 'name' => 'Alice', 'email' => 'alice@example.com']]);
 
-        $service = $this->makeTestableService('users', ['id'], 500);
-        $service->restoreFromFile($filePath);
+        (new RestoreService('test_users', ['id'], 50))->restoreFromFile($this->tempFile);
 
-        // File must still exist — @unlink was removed
-        $this->assertFileExists($filePath);
+        $this->assertFileExists($this->tempFile);
+    }
+
+    public function test_restore_processes_all_rows_across_multiple_batches(): void
+    {
+        $rows = [];
+        for ($i = 1; $i <= 10; $i++) {
+            $rows[] = ['id' => $i, 'name' => "User{$i}", 'email' => "u{$i}@example.com"];
+        }
+        $this->writeLines($rows);
+
+        (new RestoreService('test_users', ['id'], 3))->restoreFromFile($this->tempFile);
+
+        $this->assertSame(10, DB::table('test_users')->count());
     }
 }

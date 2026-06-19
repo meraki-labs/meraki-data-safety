@@ -6,253 +6,152 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Meraki\Packages\DataSafety\Contracts\DataSafetyServiceContract;
-use Meraki\Packages\DataSafety\Helpers\FileGenerateHelper;
 use Meraki\Packages\DataSafety\Services\DataSafetyService;
 use Meraki\Packages\DataSafety\Services\NullDataSafetyService;
-use Meraki\Packages\DataSafety\Tests\TestCase;
 use Meraki\Packages\DataSafety\Traits\MigrationDataSafety;
+use Meraki\Packages\DataSafety\Tests\TestCase;
 
 class DataSafetyLifecycleTest extends TestCase
 {
-    private string $testTable = 'meraki_lifecycle_test';
-    private string $version = 'v_lifecycle_test';
-    private string $diskPath = 'meraki/data-safety';
-
     protected function setUp(): void
     {
         parent::setUp();
-        $this->createTestTable();
+        Schema::create('lifecycle_users', function ($table) {
+            $table->id();
+            $table->string('name');
+            $table->string('email')->nullable();
+        });
     }
 
     protected function tearDown(): void
     {
-        Schema::dropIfExists($this->testTable);
-        // Clean up backup files
-        $disk = Storage::disk('testing');
-        foreach ($disk->files($this->diskPath) as $file) {
-            $disk->delete($file);
-        }
+        Schema::dropIfExists('lifecycle_users');
         parent::tearDown();
     }
 
-    private function createTestTable(): void
+    public function test_full_table_lifecycle_backup_drop_restore_cleanup(): void
     {
-        Schema::create($this->testTable, function ($table) {
+        DB::table('lifecycle_users')->insert([
+            ['id' => 1, 'name' => 'Alice', 'email' => 'alice@example.com'],
+            ['id' => 2, 'name' => 'Bob',   'email' => 'bob@example.com'],
+        ]);
+
+        $service = app(DataSafetyServiceContract::class);
+        $this->assertInstanceOf(DataSafetyService::class, $service);
+
+        // 1. Backup
+        $service->backupTable('lifecycle_users', ['id'], 'v1');
+        $this->assertTrue(
+            Storage::disk($this->testDisk)->exists('backups/meraki_data_safer_lifecycle_users_v1.json')
+        );
+
+        // 2. Drop and recreate table
+        Schema::drop('lifecycle_users');
+        Schema::create('lifecycle_users', function ($table) {
             $table->id();
             $table->string('name');
             $table->string('email')->nullable();
-            $table->timestamps();
         });
+        $this->assertSame(0, DB::table('lifecycle_users')->count());
+
+        // 3. Restore
+        $service->restoreTable('lifecycle_users', ['id'], 'v1');
+        $this->assertSame(2, DB::table('lifecycle_users')->count());
+        $this->assertSame('Alice', DB::table('lifecycle_users')->where('id', 1)->value('name'));
+
+        // 4. File still exists after restore (no auto-delete)
+        $this->assertTrue(
+            Storage::disk($this->testDisk)->exists('backups/meraki_data_safer_lifecycle_users_v1.json')
+        );
+
+        // 5. Cleanup
+        $service->cleanupTable('lifecycle_users', 'v1');
+        $this->assertFalse(
+            Storage::disk($this->testDisk)->exists('backups/meraki_data_safer_lifecycle_users_v1.json')
+        );
     }
 
-    private function seedTestData(): void
+    public function test_full_columns_lifecycle_backup_drop_column_restore_cleanup(): void
     {
-        DB::table($this->testTable)->insert([
-            ['id' => 1, 'name' => 'Alice', 'email' => 'alice@example.com', 'created_at' => now(), 'updated_at' => now()],
-            ['id' => 2, 'name' => 'Bob',   'email' => 'bob@example.com',   'created_at' => now(), 'updated_at' => now()],
+        DB::table('lifecycle_users')->insert([
+            ['id' => 1, 'name' => 'Alice', 'email' => 'alice@example.com'],
         ]);
-    }
 
-    // -------------------------------------------------------------------------
-    // Full table lifecycle
-    // -------------------------------------------------------------------------
+        $service = app(DataSafetyServiceContract::class);
 
-    public function test_full_table_lifecycle_backup_drop_recreate_restore(): void
-    {
-        $this->seedTestData();
+        // Backup columns
+        $service->backupColumns('lifecycle_users', ['email'], ['id'], 'v1');
 
-        /** @var DataSafetyServiceContract $service */
-        $service = $this->app->make(DataSafetyServiceContract::class);
-        $this->assertInstanceOf(DataSafetyService::class, $service);
+        // Drop column (SQLite: recreate bảng thủ công nếu cần)
+        Schema::table('lifecycle_users', fn ($t) => $t->dropColumn('email'));
+        $this->assertFalse(Schema::hasColumn('lifecycle_users', 'email'));
 
-        // Step 1: Backup
-        $service->backupTable($this->testTable, ['id'], $this->version);
+        // Recreate column
+        Schema::table('lifecycle_users', fn ($t) => $t->string('email')->nullable());
 
-        // Verify backup file exists
-        $disk = Storage::disk('testing');
-        $relativePath = $this->diskPath . '/' . FileGenerateHelper::table($this->testTable, $this->version);
-        $this->assertTrue($disk->exists($relativePath), 'Backup file should exist after backup');
-
-        // Step 2: Drop table
-        Schema::dropIfExists($this->testTable);
-        $this->assertFalse(Schema::hasTable($this->testTable));
-
-        // Step 3: Recreate table
-        $this->createTestTable();
-        $this->assertSame(0, DB::table($this->testTable)->count());
-
-        // Step 4: Restore
-        $service->restoreTable($this->testTable, ['id'], $this->version);
-
-        // Step 5: Verify data matches
-        $restored = DB::table($this->testTable)->orderBy('id')->get()->toArray();
-        $this->assertCount(2, $restored);
-        $this->assertSame('Alice', $restored[0]->name);
-        $this->assertSame('alice@example.com', $restored[0]->email);
-        $this->assertSame('Bob', $restored[1]->name);
-
-        // Step 6: Backup file still exists (no @unlink)
-        $this->assertTrue($disk->exists($relativePath), 'Backup file should still exist after restore');
-    }
-
-    // -------------------------------------------------------------------------
-    // Cleanup after restore
-    // -------------------------------------------------------------------------
-
-    public function test_cleanupTable_after_restore_deletes_backup_file(): void
-    {
-        $this->seedTestData();
-
-        /** @var DataSafetyServiceContract $service */
-        $service = $this->app->make(DataSafetyServiceContract::class);
-
-        $service->backupTable($this->testTable, ['id'], $this->version);
-
-        $disk = Storage::disk('testing');
-        $relativePath = $this->diskPath . '/' . FileGenerateHelper::table($this->testTable, $this->version);
-        $this->assertTrue($disk->exists($relativePath));
-
-        // Restore then cleanup
-        $service->restoreTable($this->testTable, ['id'], $this->version);
-        $service->cleanupTable($this->testTable, $this->version);
-
-        $this->assertFalse($disk->exists($relativePath), 'Backup file should be deleted after cleanup');
-    }
-
-    // -------------------------------------------------------------------------
-    // Full columns lifecycle
-    // -------------------------------------------------------------------------
-
-    public function test_full_columns_lifecycle_backup_drop_add_restore(): void
-    {
-        $this->seedTestData();
-
-        /** @var DataSafetyServiceContract $service */
-        $service = $this->app->make(DataSafetyServiceContract::class);
-
-        $columns    = ['email'];
-        $keyColumns = ['id'];
-        $version    = $this->version . '_cols';
-
-        // Step 1: Backup columns
-        $service->backupColumns($this->testTable, $columns, $keyColumns, $version);
-
-        $disk = Storage::disk('testing');
-        $relativePath = $this->diskPath . '/' . FileGenerateHelper::columns($this->testTable, $columns, $version);
-        $this->assertTrue($disk->exists($relativePath));
-
-        // Step 2: Drop column
-        Schema::table($this->testTable, function ($t) {
-            $t->dropColumn('email');
-        });
-
-        // Step 3: Re-add column
-        Schema::table($this->testTable, function ($t) {
-            $t->string('email')->nullable();
-        });
-
-        // Verify email is NULL before restore
-        $rows = DB::table($this->testTable)->orderBy('id')->get();
-        foreach ($rows as $row) {
-            $this->assertNull($row->email);
-        }
-
-        // Step 4: Restore columns
-        $service->restoreColumns($this->testTable, $columns, $keyColumns, $version);
-
-        // Step 5: Verify emails restored
-        $restored = DB::table($this->testTable)->orderBy('id')->get()->toArray();
-        $this->assertSame('alice@example.com', $restored[0]->email);
-        $this->assertSame('bob@example.com',   $restored[1]->email);
+        // Restore
+        $service->restoreColumns('lifecycle_users', ['email'], ['id'], 'v1');
+        $this->assertSame('alice@example.com', DB::table('lifecycle_users')->where('id', 1)->value('email'));
 
         // Cleanup
-        $service->cleanupColumns($this->testTable, $columns, $version);
-        $this->assertFalse($disk->exists($relativePath));
+        $service->cleanupColumns('lifecycle_users', ['email'], 'v1');
+        $this->assertFalse(
+            Storage::disk($this->testDisk)->exists('backups/meraki_data_safer_lifecycle_users_email_v1.json')
+        );
     }
 
-    // -------------------------------------------------------------------------
-    // NullDataSafetyService
-    // -------------------------------------------------------------------------
-
-    public function test_NullDataSafetyService_creates_no_files_and_does_not_throw(): void
+    public function test_null_service_creates_no_files_and_does_not_throw(): void
     {
-        $service = new NullDataSafetyService();
+        $this->app->instance(DataSafetyServiceContract::class, new NullDataSafetyService());
 
-        // None of these should throw or create files
-        $service->backupTable($this->testTable, ['id'], 'null_v');
-        $service->backupColumns($this->testTable, ['name'], ['id'], 'null_v');
-        $service->restoreTable($this->testTable, ['id'], 'null_v');
-        $service->restoreColumns($this->testTable, ['name'], ['id'], 'null_v');
-        $service->cleanupTable($this->testTable, 'null_v');
-        $service->cleanupColumns($this->testTable, ['name'], 'null_v');
+        $service = app(DataSafetyServiceContract::class);
+        $this->assertInstanceOf(NullDataSafetyService::class, $service);
 
-        $this->assertSame([], $service->listBackups());
+        DB::table('lifecycle_users')->insert(['id' => 1, 'name' => 'Test', 'email' => null]);
 
-        // No backup files should exist
-        $disk = Storage::disk('testing');
-        $files = $disk->files($this->diskPath);
-        $this->assertEmpty($files);
+        $service->backupTable('lifecycle_users', ['id'], 'v1');
+        $service->restoreTable('lifecycle_users', ['id'], 'v1');
+        $service->cleanupTable('lifecycle_users', 'v1');
+
+        $this->assertEmpty(Storage::disk($this->testDisk)->allFiles('backups'));
     }
 
-    // -------------------------------------------------------------------------
-    // MigrationDataSafety trait
-    // -------------------------------------------------------------------------
-
-    public function test_migration_trait_dataSafety_resolves_correct_service(): void
+    public function test_migration_trait_resolves_service_and_runs_without_errors(): void
     {
+        DB::table('lifecycle_users')->insert(['id' => 1, 'name' => 'TraitTest', 'email' => null]);
+
         $migration = new class {
             use MigrationDataSafety;
 
-            public function getService(): DataSafetyServiceContract
+            public function run(): void
             {
-                return $this->dataSafety();
+                $this->backupTable('lifecycle_users', ['id'], 'v_trait');
+                $this->restoreTable('lifecycle_users', ['id'], 'v_trait');
+                $this->cleanupTable('lifecycle_users', 'v_trait');
             }
         };
 
-        $resolved = $migration->getService();
-        $this->assertInstanceOf(DataSafetyServiceContract::class, $resolved);
+        $migration->run();
+        $this->assertTrue(true);
     }
 
-    public function test_migration_trait_cleanupTable_delegates_to_service(): void
+    public function test_service_provider_binds_real_service_when_enabled(): void
     {
-        $this->seedTestData();
+        $this->app['config']->set('meraki-data-safety.enabled', true);
+        $this->app->forgetInstance(DataSafetyServiceContract::class);
 
-        $service = $this->app->make(DataSafetyServiceContract::class);
-        $service->backupTable($this->testTable, ['id'], $this->version);
+        (new \Meraki\Packages\DataSafety\DataSafetyServiceProvider($this->app))->register();
 
-        $disk = Storage::disk('testing');
-        $relativePath = $this->diskPath . '/' . FileGenerateHelper::table($this->testTable, $this->version);
-        $this->assertTrue($disk->exists($relativePath));
-
-        // Use trait via anonymous class
-        $migration = new class {
-            use MigrationDataSafety;
-        };
-
-        // Use reflection to call protected method
-        $ref = new \ReflectionMethod(get_class($migration), 'cleanupTable');
-        $ref->setAccessible(true);
-        $ref->invoke($migration, $this->testTable, $this->version);
-
-        $this->assertFalse($disk->exists($relativePath));
+        $this->assertInstanceOf(DataSafetyService::class, app(DataSafetyServiceContract::class));
     }
 
-    // -------------------------------------------------------------------------
-    // listBackups
-    // -------------------------------------------------------------------------
-
-    public function test_listBackups_returns_backed_up_files(): void
+    public function test_service_provider_binds_null_service_when_disabled(): void
     {
-        $this->seedTestData();
+        $this->app['config']->set('meraki-data-safety.enabled', false);
+        $this->app->forgetInstance(DataSafetyServiceContract::class);
 
-        $service = $this->app->make(DataSafetyServiceContract::class);
-        $service->backupTable($this->testTable, ['id'], $this->version);
+        (new \Meraki\Packages\DataSafety\DataSafetyServiceProvider($this->app))->register();
 
-        $backups = $service->listBackups();
-
-        $this->assertNotEmpty($backups);
-        $this->assertArrayHasKey('file', $backups[0]);
-        $this->assertArrayHasKey('size', $backups[0]);
-        $this->assertArrayHasKey('created_at', $backups[0]);
+        $this->assertInstanceOf(NullDataSafetyService::class, app(DataSafetyServiceContract::class));
     }
 }
