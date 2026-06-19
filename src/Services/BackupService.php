@@ -1,47 +1,59 @@
 <?php
 
-namespace Meraki\DataSafety\Services;
+/**
+ * @internal
+ * Managed by Meraki Core Team
+ */
+
+namespace Meraki\Packages\DataSafety\Services;
 
 use Illuminate\Support\Facades\DB;
 
 class BackupService
 {
     protected string $table;
-    protected ?array $columns = null;
-    protected ?array $keyColumns = null;
-    protected int $chunkSize = 1000;
+    protected array $columns = ['*'];
+    protected array $keyColumns = ['id'];
+    protected int $chunkSize;
 
-    public function __construct(string $table)
+    /**
+     * Constructor
+     * @param string $table
+     * @param array $keyColumns
+     * @param int $chunkSize
+     */
+    public function __construct(string $table, array $keyColumns, int $chunkSize)
     {
         $this->table = $table;
+        $this->keyColumns = $keyColumns;
+        $this->chunkSize = $chunkSize;
     }
 
+    /**
+     * Set columns for backup
+     * @param array $columns
+     * @return $this
+     */
     public function columns(array $columns): self
     {
         $this->columns = $columns;
         return $this;
     }
 
-    public function keyColumns(array $keyColumns): self
-    {
-        $this->keyColumns = $keyColumns;
-        return $this;
-    }
-
     /**
-     * @param callable $callback
+     * Action backup
+     * @param callable $writer
      * @return void
      */
-    public function backup(callable $callback): void
+    public function backup(callable $writer): void
     {
-        $keyColumns = $this->keyColumns ?? ['id'];
-        $columns = $this->columns ?? ['*'];
-
         DB::table($this->table)
-            ->select($columns)
-            ->orderBy($keyColumns[0]) // cần keyColumn
-            ->chunk($this->chunkSize, function ($rows) use ($callback) {
-                $callback($rows->toArray());
+            ->select($this->columns)
+            ->orderBy($this->keyColumns[0])
+            ->chunk($this->chunkSize, function ($rows) use ($writer) {
+                foreach ($rows as $row) {
+                    $writer((array)$row);
+                }
             });
     }
 }

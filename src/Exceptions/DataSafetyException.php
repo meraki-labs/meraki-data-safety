@@ -1,9 +1,5 @@
 <?php
 
-namespace Meraki\DataSafety\Exceptions;
+namespace Meraki\Packages\DataSafety\Exceptions;
 
-use Exception;
-
-class DataSafetyException extends Exception
-{
-}
+class DataSafetyException extends \RuntimeException {}
